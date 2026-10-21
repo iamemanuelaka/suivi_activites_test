@@ -35,6 +35,52 @@ Kobo → Formulaire → *Paramètres → Services REST → Enregistrer un nouvea
 
 Sans cette option, les 3 h de délai du planning s'appliquent.
 
+
+# Sync KoboToolbox → Matrice de suivi
+
+## Fonctionnalités
+
+- ✅ Récupération automatique des soumissions KoboToolbox
+- ✅ Mise à jour de la matrice Excel (onglets MATRICE DE SUIVI + Base suivi)
+- ✅ **Dynamic Data Attachments** pour pré-remplissage du formulaire
+- ✅ Historique complet des visites
+- ✅ Envoi email hebdomadaire (lundi 7h)
+- ✅ Synchronisation toutes les 3 heures
+
+## Configuration
+
+### 1. Secrets GitHub (Settings → Secrets and variables → Actions)
+
+- `KOBO_ASSET_UID`: UID du formulaire Kobo
+- `KOBO_TOKEN`: Token API Kobo
+- `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `MAIL_FROM`, `MAIL_TO`
+
+### 2. Variables GitHub (Settings → Secrets and variables → Actions → Variables)
+
+- `KOBO_URL`: `https://kf.kobotoolbox.org` ou `https://eu.kobotoolbox.org`
+
+### 3. Configuration KoboToolbox pour Dynamic Data Attachments
+
+Dans KoboToolbox → Formulaire → Paramètres → Connecter des projets:
+- Activer le partage de données
+- Nommer la connexion: `historique` (exactement)
+
+Le workflow publiera automatiquement le fichier `historique.xml` dans `data/dda/`.
+
+## Utilisation
+
+### Lancement manuel
+
+Actions → Sync Kobo → Run workflow:
+- ✅ Envoyer l'email (pour lundi)
+- ✅ Préparer DDA (pour mettre à jour le pré-remplissage)
+
+### Test local
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env  # Éditez avec vos credentials
+python kobo_matrice_sync.py --no-mail --prepare-dda
 ## Test local
 ```bash
 pip install -r requirements.txt
