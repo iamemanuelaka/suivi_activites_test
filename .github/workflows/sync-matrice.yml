@@ -1,26 +1,25 @@
 name: Sync Kobo -> Matrice de suivi
 
 on:
-  # Mise à jour de la matrice toutes les 3 heures (sans e-mail, sans commit s'il n'y a rien de nouveau)
   schedule:
     - cron: "15 */3 * * *"
-    # Envoi hebdomadaire : chaque lundi 07:00 UTC (= 07:00 à Abidjan)
     - cron: "0 7 * * 1"
-  # Lancement manuel depuis l'onglet Actions
   workflow_dispatch:
     inputs:
       send_mail:
         description: "Envoyer l'e-mail avec la matrice"
         type: boolean
         default: false
-  # Déclenchement immédiat (optionnel) par un webhook Kobo à chaque nouvelle soumission
+      prepare_dda:
+        description: "Préparer les données Dynamic Data Attachments"
+        type: boolean
+        default: false
   repository_dispatch:
     types: [kobo_submission]
 
 permissions:
   contents: write
 
-# Un seul run à la fois, pour éviter les conflits de commit
 concurrency:
   group: sync-matrice
   cancel-in-progress: false
@@ -33,26 +32,27 @@ jobs:
       TZ: Africa/Abidjan
     steps:
       - uses: actions/checkout@v4
-
+      
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
-
+      
       - run: pip install -r requirements.txt
-
-      - name: Déterminer le mode (hebdo = avec e-mail)
+      
+      - name: Déterminer le mode
         id: mode
         run: |
-          if [ "${{ github.event.schedule }}" = "0 7 * * 1" ] || [ "${{ github.event.inputs.send_mail }}" = "true" ]; then
-            echo "args=" >> "$GITHUB_OUTPUT"
-            echo "label=hebdomadaire (avec e-mail)" >> "$GITHUB_OUTPUT"
-          else
-            echo "args=--no-mail --skip-if-unchanged" >> "$GITHUB_OUTPUT"
-            echo "label=mise à jour simple" >> "$GITHUB_OUTPUT"
+          ARGS=""
+          if [ "${{ github.event.inputs.send_mail }}" != "true" ]; then
+            ARGS="--no-mail"
           fi
-
-      - name: Synchroniser Kobo -> matrice (${{ steps.mode.outputs.label }})
+          if [ "${{ github.event.inputs.prepare_dda }}" = "true" ] || [ "${{ github.event.schedule }}" = "15 */3 * * *" ]; then
+            ARGS="$ARGS --prepare-dda"
+          fi
+          echo "args=$ARGS" >> "$GITHUB_OUTPUT"
+      
+      - name: Synchroniser Kobo -> matrice
         id: sync
         env:
           KOBO_URL: ${{ vars.KOBO_URL || 'https://kf.kobotoolbox.org' }}
@@ -66,24 +66,33 @@ jobs:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
+          DDA_OUTPUT_DIR: data/dda
         run: python kobo_matrice_sync.py ${{ steps.mode.outputs.args }}
-
-      - name: Enregistrer la matrice dans le dépôt
-        if: ${{ !cancelled() }}
+      
+      - name: Publier les données Dynamic Data Attachments
+        if: steps.sync.outputs.dda_path != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: dynamic-data-attachments
+          path: ${{ steps.sync.outputs.dda_path }}
+          retention-days: 30
+      
+      - name: Enregistrer la matrice
+        if: !cancelled()
         run: |
-          git config user.name  "kobo-sync-bot"
+          git config user.name "kobo-sync-bot"
           git config user.email "kobo-sync-bot@users.noreply.github.com"
-          git add -A matrices
+          git add -A matrices data/dda
           if git diff --cached --quiet; then
-            echo "Aucun changement à enregistrer."
+            echo "Aucun changement."
           else
-            git commit -m "Matrice mise à jour automatiquement ($(date +%d/%m/%Y' '%H:%M))"
+            git commit -m "Matrice + DDA mis à jour ($(date +%d/%m/%Y' '%H:%M))"
             git pull --rebase origin "${GITHUB_REF_NAME}"
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
-
-      - name: Archiver la matrice (téléchargeable depuis le run)
-        if: ${{ steps.sync.outputs.matrix_path != '' }}
+      
+      - name: Archiver la matrice
+        if: steps.sync.outputs.matrix_path != ''
         uses: actions/upload-artifact@v4
         with:
           name: matrice-de-suivi
