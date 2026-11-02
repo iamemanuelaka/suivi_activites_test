@@ -1,21 +1,26 @@
 name: Sync Kobo -> Matrice de suivi
 
 on:
+  # Mise à jour de la matrice toutes les 3 heures (sans e-mail, sans commit s'il n'y a rien de nouveau)
   schedule:
-    - cron: "15 */3 * * *"   # mise à jour toutes les 3 h (sans e-mail, sans commit s'il n'y a rien de nouveau)
-    - cron: "0 7 * * 1"      # envoi hebdomadaire : lundi 07:00 UTC (= Abidjan)
+    - cron: "15 */3 * * *"
+    # Envoi hebdomadaire : chaque lundi 07:00 UTC (= 07:00 à Abidjan)
+    - cron: "0 7 * * 1"
+  # Lancement manuel depuis l'onglet Actions
   workflow_dispatch:
     inputs:
       send_mail:
         description: "Envoyer l'e-mail avec la matrice"
         type: boolean
         default: false
-  repository_dispatch:       # optionnel : webhook Kobo à chaque soumission
+  # Déclenchement immédiat (optionnel) par un webhook Kobo à chaque nouvelle soumission
+  repository_dispatch:
     types: [kobo_submission]
 
 permissions:
   contents: write
 
+# Un seul run à la fois, pour éviter les conflits de commit
 concurrency:
   group: sync-matrice
   cancel-in-progress: false
@@ -34,19 +39,23 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Installer les dépendances
-        run: pip install -r requirements.txt
+      - run: pip install -r requirements.txt
 
-      - name: Déterminer le mode (hebdomadaire = avec e-mail)
+      # Les tests protègent le tableau de bord : un script cassé ne doit jamais écraser la matrice
+      - run: pip install pytest openpyxl && python -m pytest -q tests
+
+      - name: Déterminer le mode (hebdo = avec e-mail)
         id: mode
         run: |
           if [ "${{ github.event.schedule }}" = "0 7 * * 1" ] || [ "${{ github.event.inputs.send_mail }}" = "true" ]; then
             echo "args=" >> "$GITHUB_OUTPUT"
+            echo "label=hebdomadaire (avec e-mail)" >> "$GITHUB_OUTPUT"
           else
             echo "args=--no-mail --skip-if-unchanged" >> "$GITHUB_OUTPUT"
+            echo "label=mise à jour simple" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Synchroniser Kobo -> matrice
+      - name: Synchroniser Kobo -> matrice (${{ steps.mode.outputs.label }})
         id: sync
         env:
           KOBO_URL: ${{ vars.KOBO_URL || 'https://kf.kobotoolbox.org' }}
@@ -54,31 +63,20 @@ jobs:
           KOBO_TOKEN: ${{ secrets.KOBO_TOKEN }}
           MATRIX_DIR: matrices
           MATRIX_KEEP: "8"
-          PHOTO_DIR: photos
-          HISTORY_DIR: historique
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT || '587' }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
         run: python kobo_matrice_sync.py ${{ steps.mode.outputs.args }}
 
-     
-
-
-      - name: Enregistrer matrice, photos et journal dans le dépôt
-        if: ${{ !cancelled() }}
+      - name: Enregistrer la matrice et le journal dans le dépôt
+        if: ${{ steps.sync.outcome == 'success' }}
         run: |
-          mkdir -p data/dda
           git config user.name  "kobo-sync-bot"
           git config user.email "kobo-sync-bot@users.noreply.github.com"
-
-          git add -A matrices photos historique
-          if [ -d data/dda ]; then
-            git add -A data/dda
-          fi
-
+          git add -A matrices
           if git diff --cached --quiet; then
             echo "Aucun changement à enregistrer."
           else
@@ -86,8 +84,6 @@ jobs:
             git pull --rebase origin "${GITHUB_REF_NAME}"
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
-
-          
 
       - name: Archiver la matrice (téléchargeable depuis le run)
         if: ${{ steps.sync.outputs.matrix_path != '' }}
