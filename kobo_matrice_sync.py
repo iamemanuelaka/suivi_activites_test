@@ -213,6 +213,9 @@ HEADER_RULES = {
     "taux":        lambda h: h.startswith("TAUX D") and "FINANC" not in h,
     "volume":      lambda h: h.startswith("VOLUME"),
     "remise":      lambda h: h.startswith("DATE DE REMISE"),
+    "conso":       lambda h: h.startswith("CONSOMMATION DU DELAI"),
+    "fin":         lambda h: h.startswith("FIN DES TRAVAUX"),
+    "delai":       lambda h: h.startswith("DELAI"),
     "statut":      lambda h: h.startswith("STATUT DU CHANTIER") or h == "STATUT",
     "obs_tech":    lambda h: h.startswith("OBSERVATIONS TECHNIQUES"),
     "pges":        lambda h: h.startswith("OBSERVATIONS ENVIRONNEMENTALES"),
@@ -323,6 +326,63 @@ def num(v):
     return int(f) if f.is_integer() else f
 
 
+ALERT_TYPE = "Retard potentiel d'exécution"
+DEFAULT_THRESHOLDS = (30, 50)
+
+
+def edate(d: dt.date, months: int) -> dt.date:
+    """Équivalent d'EDATE d'Excel."""
+    y, m = divmod(d.month - 1 + int(months), 12)
+    y, m = d.year + y, m + 1
+    last = (dt.date(y + (m == 12), m % 12 + 1, 1) - dt.timedelta(days=1)).day
+    return dt.date(y, m, min(d.day, last))
+
+
+def from_serial(v) -> dt.date | None:
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return (dt.datetime(1899, 12, 30) + dt.timedelta(days=float(v))).date()
+
+
+def compute_alerts(pkg: Package, ws, rows: dict[int, int], cols: dict[str, int], today: dt.date) -> dict:
+    """Règle : taux d'exécution < seuil (30 %) ET consommation du délai >= seuil (50 %).
+    Consommation = temps écoulé (aujourd'hui − début des travaux) ÷ durée prévue (fin prévue − début) × 100.
+    Non évaluable (jamais compté) : taux absent, début ou fin/délai absents, dates incohérentes, activité achevée."""
+    seuil_taux, seuil_delai = DEFAULT_THRESHOLDS
+    if pkg.has_sheet("PARAMETRES"):
+        pr = pkg.sheet("PARAMETRES")
+        a, b = pr.get(5, 6), pr.get(6, 6)
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            seuil_taux, seuil_delai = a, b
+    out = {"alerts": [], "not_evaluable": {}, "thresholds": (seuil_taux, seuil_delai)}
+    for n, r in sorted(rows.items()):
+        taux = ws.get(r, cols["taux"])
+        taux = taux * 100 if isinstance(taux, (int, float)) and 0 < taux < 1 else taux
+        start = from_serial(ws.get(r, cols["debut"])) if "debut" in cols else None
+        statut = str(ws.get(r, cols["statut"]) or "").strip() if "statut" in cols else ""
+        end = None
+        if "fin" in cols and not ws.has_formula(r, cols["fin"]):
+            end = from_serial(ws.get(r, cols["fin"]))
+        if end is None and start and "delai" in cols and isinstance(ws.get(r, cols["delai"]), (int, float)):
+            end = edate(start, ws.get(r, cols["delai"]))
+        if end is None and start and "fin" in cols:
+            end = from_serial(ws.get(r, cols["fin"]))     # valeur en cache de la formule EDATE
+        reason = None
+        if not isinstance(taux, (int, float)) or isinstance(taux, bool): reason = "taux d'exécution manquant"
+        elif statut == "Achevé": reason = "activité achevée"
+        elif start is None: reason = "début des travaux manquant"
+        elif end is None: reason = "fin prévue ou délai manquant"
+        elif (end - start).days <= 0: reason = "dates incohérentes ou durée nulle"
+        if reason:
+            out["not_evaluable"][n] = reason
+            continue
+        conso = max(0, (today - start).days) / (end - start).days * 100
+        if taux < seuil_taux and conso >= seuil_delai:
+            out["alerts"].append({"lot": n, "taux": taux, "conso": round(conso, 1)})
+    out["alerts"].sort(key=lambda a: (-(a["conso"] - a["taux"]), a["lot"]))
+    return out
+
+
 def update_matrix(pkg: Package, latest: dict[int, dict], sheet_name: str) -> dict:
     ws = pkg.sheet(sheet_name)
     header_row, cols = find_columns(ws)
@@ -377,7 +437,8 @@ def update_matrix(pkg: Package, latest: dict[int, dict], sheet_name: str) -> dic
     vals = [ws.get(r, cols["taux"]) for r in rows.values()]
     vals = [v * 100 if 0 < v < 1 else v for v in vals if isinstance(v, (int, float)) and not isinstance(v, bool)]  # même lecture que le tableau de bord
     mean = round(sum(vals) / len(vals), 2) if vals else 0
-    return {"rows": rows, "ident": ident, "mean": mean, "cols": cols, "formula_cells": skipped_formula}
+    return {"rows": rows, "ident": ident, "mean": mean, "cols": cols, "formula_cells": skipped_formula,
+            "alerts": compute_alerts(pkg, ws, rows, cols, dt.date.today())}
 
 
 def update_meta(pkg: Package, now: dt.datetime, mean: float) -> None:
@@ -462,6 +523,19 @@ def step_summary(lines: list[str]) -> None:
             fh.write("\n".join(lines) + "\n")
 
 
+EXPECTED_FIELDS = ["id_projet", "date_mission", "statut", "taux_execution", "obs_techniques", "pges_statut", "Il_y_a_t_il_une_ONG_mobilis_e",
+                   "Montant_d_caiss_sur_e_budget_total_FCFA", "Taux_d_ex_cution_financi_re_", "nom_agent", "agent", "Structure", "photo_1"]
+
+
+def check_fields(subs: list[dict]) -> list[str]:
+    """Champs attendus par le script mais renseignés dans AUCUNE soumission : signe d'un champ renommé dans le formulaire Kobo
+    (ou d'un champ vraiment jamais rempli). Le script continue, mais le signale dans le journal et dans le résumé du run."""
+    if not subs:
+        return []
+    seen = {k for s in subs for k, v in s.items() if v not in (None, "")}
+    return [f for f in EXPECTED_FIELDS if f not in seen]
+
+
 def find_base_matrix(matrix_dir: Path, explicit: str | None) -> Path:
     if explicit:
         return Path(explicit)
@@ -500,9 +574,11 @@ def build_summary(info: dict, latest: dict[int, dict], today: dt.date) -> dict:
             reported.append(label)
         else:
             missing.append(label)
-        if s and s.get("statut") in STATUTS_A_SURVEILLER:
-            watch.append(f"{label} : {STATUT[s['statut']]}")
-    return {"reported": reported, "missing": missing, "watch": watch, "mean": info["mean"], "total": len(info["rows"])}
+    for a in info["alerts"]["alerts"]:
+        n = a["lot"]
+        watch.append(f"Lot {n:02d} – {info['ident'][n]['departement']} ({info['ident'][n]['entreprise']}) : exécution {a['taux']:g} % pour {a['conso']:g} % du délai consommé")
+    return {"reported": reported, "missing": missing, "watch": watch, "mean": info["mean"], "total": len(info["rows"]),
+            "n_alerts": len(info["alerts"]["alerts"]), "thresholds": info["alerts"]["thresholds"], "not_evaluable": len(info["alerts"]["not_evaluable"])}
 
 
 def mail_body(summ: dict, today: dt.date) -> str:
@@ -516,8 +592,11 @@ def mail_body(summ: dict, today: dt.date) -> str:
     ]
     if summ["missing"]:
         lines += ["", "Lots sans visite cette semaine :"] + [f"  - {x}" for x in summ["missing"]]
+    t1, t2 = summ["thresholds"]
+    lines += ["", f"Activités en alerte ({ALERT_TYPE} : exécution < {t1:g} % ET délai consommé ≥ {t2:g} %) : {summ['n_alerts']}"
+                  f" (non évaluables : {summ['not_evaluable']})"]
     if summ["watch"]:
-        lines += ["", "Points d'attention :"] + [f"  - {x}" for x in summ["watch"]]
+        lines += [f"  - {x}" for x in summ["watch"][:15]] + ([f"  … et {len(summ['watch']) - 15} autre(s) : voir la feuille « DÉTAIL DES ALERTES »."] if len(summ["watch"]) > 15 else [])
     lines += ["", "Message généré automatiquement à partir des données KoboToolbox.", "", "Cordialement"]
     return "\n".join(lines)
 
@@ -569,6 +648,12 @@ def run(args) -> int:
     subs = [flatten(s) for s in raw]
     latest = latest_per_lot(subs)
     log.info("%d soumission(s), %d lot(s) avec au moins une visite valide", len(subs), len(latest))
+    absent = check_fields(subs)
+    if absent:
+        log.warning("Champs attendus jamais renseignés dans les soumissions : %s (champ renommé dans Kobo ?)", ", ".join(absent))
+        step_summary([f"### ⚠ Champs Kobo introuvables", f"Jamais renseignés dans les {len(subs)} soumission(s) : `{'`, `'.join(absent)}`. Vérifier le nom des champs du formulaire."])
+        if os.environ.get("GITHUB_ACTIONS"):
+            print(f"::warning title=Champs Kobo::{', '.join(absent)}")
 
     base = find_base_matrix(matrix_dir, args.base)
     log.info("Matrice de départ : %s", base.name)
@@ -590,7 +675,7 @@ def run(args) -> int:
     pkg.save(out)
     state_path.write_text(json.dumps({"fingerprint": fp, "last_run": now.isoformat(), "matrix": out.name, "lots": len(latest)}, indent=1), encoding="utf-8")
     log.info("Matrice enregistrée : %s (taux moyen %s %%)", out, info["mean"])
-    step_summary(["### Sync Kobo", f"- Matrice : `{out.name}`", f"- Lots mis à jour : **{len(latest)}**  ·  taux moyen **{info['mean']} %**",
+    step_summary(["### Sync Kobo", f"- Matrice : `{out.name}`", f"- Lots mis à jour : **{len(latest)}**  ·  taux moyen **{info['mean']} %**", f"- Activités en alerte (règle taux < {info['alerts']['thresholds'][0]:g} % ET délai ≥ {info['alerts']['thresholds'][1]:g} %) : **{len(info['alerts']['alerts'])}** ; non évaluables : {len(info['alerts']['not_evaluable'])}",
                   f"- Journal : +{added} / ~{updated} ligne(s)"] + ([f"- ⚠ Cellules à formule non modifiées : {', '.join(info['formula_cells'])}"] if info["formula_cells"] else []))
     prune_old(matrix_dir, keep=int(cfg("MATRIX_KEEP", "8")), current=out)
     if os.environ.get("GITHUB_OUTPUT"):
